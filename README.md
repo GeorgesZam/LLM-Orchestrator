@@ -35,3 +35,10 @@
    ```bash
    git clone https://github.com/your-username/llm-orchestrator.git
    cd llm-orchestrator
+   ```
+
+
+ 2. Install the required packages:
+    ```bash
+    pip install -r requirements.txt
+    ```
