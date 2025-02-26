@@ -1,38 +1,37 @@
 # 🤖 LLM Orchestrator
 
-**LLM Orchestrator** est une application open source qui permet d'interagir intelligemment avec plusieurs modèles de langage (LLM) via une interface web conviviale développée avec **Streamlit**. Elle sélectionne automatiquement le modèle le plus adapté à votre question, améliore itérativement les réponses et gère les conversations de manière fluide. Que vous ayez besoin d'aide pour du code, des analyses ou des questions générales, **LLM Orchestrator** vous offre une expérience utilisateur optimale.
+**LLM Orchestrator** is an open-source application that lets you interact with multiple large language models (LLMs) through an intuitive web interface built with **Streamlit**. It smartly picks the best model for your query, refines answers iteratively, and keeps your conversations flowing naturally. Whether you're coding, analyzing data, or just curious, **LLM Orchestrator** makes it easy and effective.
 
 ---
 
-## 🚀 Fonctionnalités principales
+## 🚀 Key Features
 
-- **Sélection intelligente des modèles** : Choisit le modèle LLM le plus pertinent en fonction de votre question (code, analyse, général, etc.).
-- **Amélioration itérative des réponses** : Affine les réponses en utilisant plusieurs modèles pour garantir la meilleure qualité possible.
-- **Gestion des conversations** : Sauvegarde l'historique des chats et maintient le contexte pour des échanges cohérents.
-- **Adaptabilité aux ressources machine** : Prend en compte la RAM et la mémoire GPU pour recommander des modèles compatibles.
-- **Support multilingue** : Détecte la langue de la question et ajuste les réponses en conséquence (bonus pour le français avec `mistral`).
-- **Interface intuitive** : Interface web simple et efficace grâce à **Streamlit**.
-
----
-
-## 🛠️ Technologies utilisées
-
-- **[Streamlit](https://streamlit.io/)** : Pour l'interface utilisateur interactive.
-- **[Ollama](https://ollama.ai/)** : Pour l'intégration et la gestion des modèles LLM.
-- **[NetworkX](https://networkx.org/)** et **[Pyvis](https://pyvis.readthedocs.io/)** : Pour la visualisation des graphes (si applicable).
-- **[Pandas](https://pandas.pydata.org/)** : Pour la manipulation des données.
+- **Smart Model Selection**: Automatically picks the right LLM for your question (e.g., coding, analysis, or general queries).
+- **Response Refinement**: Improves answers step-by-step using multiple models for top-notch results.
+- **Chat History**: Saves your conversations and keeps the context intact.
+- **Resource Awareness**: Adapts to your machine’s RAM and GPU to suggest suitable models.
+- **Multilingual Magic**: Detects your question’s language and responds accordingly (bonus points for French with `mistral`).
+- **User-Friendly Design**: A clean, simple interface powered by **Streamlit**.
 
 ---
 
-## 📦 Installation et configuration
+## 🛠️ Technologies Used
 
-### Prérequis
-- **Python 3.8+** installé.
-- **Ollama** installé et configuré sur votre machine. [Instructions d'installation d'Ollama](https://ollama.ai/docs/installation).
-- Les modèles LLM nécessaires doivent être téléchargés via Ollama (par exemple, `ollama pull llama2`).
+- **[Streamlit](https://streamlit.io/)**: Powers the interactive web interface.
+- **[Ollama](https://ollama.ai/)**: Handles LLM integration and management.
 
-### Étapes d'installation
-1. Clonez le repository :
+
+---
+
+## 📦 Installation and Setup
+
+### Prerequisites
+- **Python 3.8+** installed on your system.
+- **Ollama** set up and running. Check out the [Ollama Installation Guide](https://ollama.ai/docs/installation).
+- Download your preferred LLM models via Ollama (e.g., `ollama pull llama2`).
+
+### Installation Steps
+1. Clone the repository:
    ```bash
-   git clone https://github.com/votre-utilisateur/llm-orchestrator.git
+   git clone https://github.com/your-username/llm-orchestrator.git
    cd llm-orchestrator
