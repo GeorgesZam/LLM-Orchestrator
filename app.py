@@ -1,14 +1,9 @@
 import streamlit as st
 import ollama
-import networkx as nx
-from pyvis.network import Network
-import pandas as pd
 import json
 import time
-from streamlit_chat import message
 import os
 import re
-import requests
 import psutil
 import platform
 import subprocess
@@ -80,7 +75,7 @@ MODEL_INFO = {
 }
 
 # Configuration de la page Streamlit
-st.set_page_config(page_title="LLM Manager Pro", layout="wide")
+st.set_page_config(page_title="LLM Orchestrator", layout="wide")
 
 # Styles CSS personnalisés
 st.markdown("""
@@ -789,7 +784,7 @@ def show_current_chat():
 
 def main():
     """Point d'entrée principal"""
-    st.markdown("<h1 class='main-header'>🤖 LLM Manager Pro</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 class='main-header'>LLM Orchestrator</h1>", unsafe_allow_html=True)
 
     initialize_session_state()
     setup_ollama_connection()
@@ -798,7 +793,7 @@ def main():
     show_chat_sidebar()
 
     if not st.session_state.client:
-        st.warning("⚠️ Please configure and connect to an Ollama server first")
+        st.warning("Please configure and connect to an Ollama server first")
         return
 
     show_current_chat()
@@ -817,7 +812,7 @@ def main():
             )
         with col2:
             st.markdown(f"""
-            🧠 Intelligence:
+            Intelligence:
             - IQ 100 (30)
             - IQ 120 (60)
             - IQ 140 (120)
