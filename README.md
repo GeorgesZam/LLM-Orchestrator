@@ -45,3 +45,7 @@
     ```bash
     streamlit run app.py
     ```
+ 4. Launch ollama:
+    ```bash
+    ollama serve # make sure you have Models installed 
+    ```
