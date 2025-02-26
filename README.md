@@ -37,8 +37,11 @@
    cd llm-orchestrator
    ```
 
-
  2. Install the required packages:
     ```bash
     pip install -r requirements.txt
+    ```
+ 3. Launch the app:
+    ```bash
+    streamlit run app.py
     ```
