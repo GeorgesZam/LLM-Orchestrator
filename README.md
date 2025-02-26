@@ -47,5 +47,5 @@
     ```
  4. Launch ollama:
     ```bash
-    ollama serve # make sure you have Models installed 
+    ollama serve  
     ```
