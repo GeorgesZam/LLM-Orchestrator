@@ -1,11 +1,18 @@
 import streamlit as st
 import ollama
+import networkx as nx
+from pyvis.network import Network
+import pandas as pd
 import json
 import time
+from streamlit_chat import message
+import os
 import re
+import requests
 import psutil
 import platform
 import subprocess
+from datetime import datetime
 
 # Dictionnaire des modèles et leurs caractéristiques
 MODEL_INFO = {
@@ -105,18 +112,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Initialisation des variables de session
-if 'chat_history' not in st.session_state:
-    st.session_state.chat_history = []
-if 'current_iteration' not in st.session_state:
-    st.session_state.current_iteration = 0
-if 'best_response' not in st.session_state:
-    st.session_state.best_response = None
-if 'client' not in st.session_state:
-    st.session_state.client = ollama.Client(host="http://localhost:11434")
-if 'stop_generation' not in st.session_state:
-    st.session_state.stop_generation = False
-
 
 def get_gpu_memory():
     """Obtient la mémoire GPU disponible en GB"""
@@ -182,20 +177,27 @@ def get_available_models():
     """Récupère la liste des modèles disponibles sur le serveur Ollama"""
     try:
         response = st.session_state.client.list()
-        available_models = {}  # Dictionnaire pour stocker {nom_base: nom_complet}
+        available_models = {}
 
-        # Extraire les noms de modèles avec leurs tags
+        # Extraire les noms de modèles
         for model_obj in response.models:
             if hasattr(model_obj, 'model'):
-                full_name = str(model_obj.model)  # Convertir en string
-                base_name = full_name.split(':')[0]  # ex: "qwen2"
-                if base_name in MODEL_INFO:  # Vérifier si le modèle est configuré
+                full_name = str(model_obj.model)  # ex: "llama2:latest"
+                base_name = full_name.split(':')[0]  # ex: "llama2"
+
+                # Vérifier si le modèle est dans notre configuration
+                if base_name in MODEL_INFO:
                     available_models[base_name] = full_name
+
+        if not available_models:
+            st.error("Aucun modèle configuré n'est disponible sur le serveur Ollama")
+            st.info("Modèles configurés : " + ", ".join(MODEL_INFO.keys()))
+            st.info("Modèles installés : " + ", ".join(m.model for m in response.models if hasattr(m, 'model')))
 
         return available_models
 
     except Exception as e:
-        st.error(f"Erreur lors de la récupération des modèles : {e}")
+        st.error(f"Erreur lors de la récupération des modèles : {str(e)}")
         return {}
 
 
@@ -276,25 +278,31 @@ def iterative_improvement(question, models, max_time=60):
     return best_response
 
 
-def get_response(model, question):
-    """Obtient la réponse d'un modèle avec streaming"""
+def get_response(model, question, chat_id):
+    """Obtient la réponse avec contexte du chat"""
     try:
+        # Afficher d'abord le modèle utilisé
         response_container = st.empty()
+        response_container.markdown(f"*🤖 Réponse de {model}...*")
+
         full_response = ""
 
-        # Boutons de contrôle
-        skip = st.button("⏭️ Skip", key=f"skip_{model}")
-        delire = st.button("🚫 Délire", key=f"delire_{model}")
+        # Construire le contexte
+        messages = [
+            {'role': 'system', 'content': 'You are a helpful assistant. Maintain context of the conversation.'}
+        ]
 
-        if skip or delire:
-            status = 'skipped' if skip else 'delire'
-            message = "*Réponse ignorée*" if skip else "*❌ Modèle marqué comme délirant*"
-            response_container.markdown(message)
-            return {'status': status, 'content': None, 'model': model}
+        # Ajouter l'historique du chat actuel
+        chat = st.session_state.chats[chat_id]
+        for msg in chat['messages']:
+            messages.append(msg)
+
+        # Ajouter la nouvelle question
+        messages.append({'role': 'user', 'content': question})
 
         stream_response = st.session_state.client.chat(
             model=model,
-            messages=[{'role': 'user', 'content': question}],
+            messages=messages,
             stream=True
         )
 
@@ -302,14 +310,32 @@ def get_response(model, question):
             if 'message' in chunk and 'content' in chunk['message']:
                 content = chunk['message']['content']
                 full_response += content
-                response_container.markdown(full_response + "▌")
+                response_container.markdown(f"*🤖 {model}:*\n{full_response}▌")
 
-        response_container.markdown(full_response)
-        return {'status': 'success', 'content': full_response, 'model': model}
+        # Afficher la réponse finale avec le modèle
+        response_container.markdown(f"*🤖 {model}:*\n{full_response}")
+
+        # Mettre à jour le chat
+        chat['messages'].append({
+            'role': 'user',
+            'content': question,
+            'model': model
+        })
+        chat['messages'].append({
+            'role': 'assistant',
+            'content': full_response,
+            'model': model
+        })
+        chat['model'] = model
+
+        # Sauvegarder
+        save_chats()
+
+        return {'status': 'success', 'content': full_response}
 
     except Exception as e:
-        st.error(f"Erreur avec {model}: {e}")
-        return {'status': 'error', 'content': None, 'model': model}
+        st.error(f"Error: {str(e)}")
+        return {'status': 'error', 'content': str(e)}
 
 
 def synthesize_responses(responses):
@@ -351,41 +377,106 @@ def get_model_base_name(full_name):
     return full_name.split(':')[0]
 
 
+def get_model_categories(available_models, MODEL_INFO):
+    """Détermine les catégories de modèles selon la machine"""
+    try:
+        # Récupérer les specs machine
+        ram_gb = st.session_state.MACHINE_CONFIG.get('ram_gb', 8)  # 8GB par défaut
+        gpu_memory_gb = st.session_state.MACHINE_CONFIG.get('gpu_memory_gb', 0)
+
+        # Calculer la mémoire totale disponible
+        total_memory = max(ram_gb, gpu_memory_gb if gpu_memory_gb else 0)
+
+        # Adapter les seuils selon la mémoire disponible
+        if total_memory >= 32:  # Machine puissante
+            thresholds = {'GRAND': 13, 'MOYEN': 7}
+        elif total_memory >= 16:  # Machine moyenne
+            thresholds = {'GRAND': 7, 'MOYEN': 3}
+        else:  # Machine modeste
+            thresholds = {'GRAND': 3, 'MOYEN': 1}
+
+        # Catégoriser les modèles disponibles
+        categories = {}
+        for name in available_models.keys():
+            if name in MODEL_INFO:
+                size = float(MODEL_INFO[name]['size'].replace('B', ''))
+                if size >= thresholds['GRAND']:
+                    categories[name] = 'GRAND'
+                elif size >= thresholds['MOYEN']:
+                    categories[name] = 'MOYEN'
+                else:
+                    categories[name] = 'PETIT'
+
+        return categories, thresholds
+
+    except Exception as e:
+        # Valeurs par défaut si erreur
+        default_categories = {
+            name: 'MOYEN' if float(MODEL_INFO[name]['size'].replace('B', '')) >= 1 else 'PETIT'
+            for name in available_models.keys() if name in MODEL_INFO
+        }
+        return default_categories, {'GRAND': 7, 'MOYEN': 1}
+
+
 def get_manager_prompt(question, max_time, available_models, MODEL_INFO):
-    """Crée le prompt pour le LLM manager"""
-    return f"""Vous êtes un assistant qui choisit le meilleur modèle selon la question.
+    """Crée le prompt pour le LLM manager en français"""
+    return f"""Tu es un expert en sélection de modèles LLM. Choisis rapidement le modèle le plus adapté.
 
-Question : {question}
-Temps disponible : {max_time} secondes
-Modèles disponibles : {', '.join(available_models.keys())}
+Question : "{question}"
 
-Règles de sélection :
-1. Questions scientifiques/complexes → mistral ou phi4
-2. Questions de programmation → llama2
-3. Questions simples/reformulation → qwen2
+Modèles disponibles :
+{json.dumps(list(available_models.values()), indent=2)}
 
-Analysez la question et choisissez le modèle le plus adapté.
-Répondez en JSON :
+Règles simples :
+- Calculs, salutations : petit modèle
+- Questions de connaissance : modèle moyen
+- Analyses complexes : grand modèle
+
+Format JSON uniquement :
 {{
     "selected_models": ["nom_du_modele"],
-    "reformulated_question": "question claire",
-    "strategy": "raison du choix"
+    "strategy": "Raison courte"
 }}"""
 
 
+def analyze_question_complexity(question):
+    """Analyse la complexité de la question"""
+    # Mots clés pour questions simples
+    simple_patterns = [
+        r'^hey\b',
+        r'^hello\b',
+        r'^hi\b',
+        r'^\d+[\s+\-*/]\d+',  # Opérations mathématiques simples
+        r'^bonjour\b',
+        r'^salut\b',
+    ]
+
+    # Vérifier les patterns simples
+    for pattern in simple_patterns:
+        if re.match(pattern, question.lower()):
+            return "PETIT"
+
+    # Analyser la longueur et la complexité
+    words = question.split()
+    if len(words) < 10 and not any(char in question for char in '?!,;:'):
+        return "PETIT"
+
+    return None  # Laisser le manager décider
+
+
 def get_manager_decision(question, max_time):
+    """Obtient rapidement la décision du manager"""
     available_models = get_available_models()
 
     if not available_models:
-        st.error("Aucun modèle disponible")
+        st.error("No models available")
         return None
 
-    # Utiliser qwen2 comme manager
-    manager_model = available_models.get('qwen2', list(available_models.values())[0])
-
-    # Détection du type de question
-    is_scientific = any(word in question.lower() for word in ['pourquoi', 'comment', 'origine', 'science', 'théorie'])
-    is_code = any(word in question.lower() for word in ['code', 'programme', 'python', 'javascript'])
+    # Utiliser le plus petit modèle comme manager
+    manager_model = min(
+        available_models.values(),
+        key=lambda m: float(MODEL_INFO[m.split(':')[0]]['size'].replace('B', ''))
+    )
 
     try:
         response = st.session_state.client.chat(
@@ -394,114 +485,362 @@ def get_manager_decision(question, max_time):
                 'role': 'user',
                 'content': get_manager_prompt(question, max_time, available_models, MODEL_INFO)
             }],
-            stream=False
+            stream=False,
+            options={'temperature': 0}  # Réponse plus directe
         )
 
-        try:
-            content = response['message']['content'].strip()
-            if content.startswith("```"):
-                content = re.sub(r'^```.*\n|```$', '', content)
+        content = response['message']['content'].strip()
+        if content.startswith("```"):
+            content = re.sub(r'^```.*\n|```$', '', content)
 
-            decision = json.loads(content)
+        decision = json.loads(content)
+        selected_model = decision['selected_models'][0]
 
-            # Forcer le choix du modèle selon le type de question
-            if is_scientific and 'mistral' in available_models:
-                selected_model = 'mistral'
-            elif is_code and 'llama2' in available_models:
-                selected_model = 'llama2'
-            else:
-                selected_model = decision['selected_models'][0]
-
-            if selected_model in available_models:
-                decision['selected_models'] = [available_models[selected_model]]
-                return decision
-            else:
-                st.error(f"Modèle {selected_model} non disponible")
-                return None
-
-        except Exception as e:
-            st.error(f"Erreur de parsing: {str(e)}")
-            return None
+        if selected_model in available_models.values():
+            return decision
+        else:
+            fallback_model = list(available_models.values())[0]
+            return {
+                'selected_models': [fallback_model],
+                'strategy': f"Modèle par défaut"
+            }
 
     except Exception as e:
-        st.error(f"Erreur du manager: {str(e)}")
-        return None
+        st.error(f"Error: {str(e)}")
+        fallback_model = list(available_models.values())[0]
+        return {
+            'selected_models': [fallback_model],
+            'strategy': "Modèle par défaut (erreur)"
+        }
 
 
-# Interface principale
-st.markdown("<h1 class='main-header'>🤖 LLM Manager Pro</h1>", unsafe_allow_html=True)
-
-# Afficher la configuration machine
-show_machine_config()
-
-# Paramètres
-col1, col2 = st.columns([1, 3])
-
-with col1:
-    st.markdown("### Modèles disponibles")
-    available_models = get_available_models()  # Récupérer les modèles réellement disponibles
-
-    if not available_models:
-        st.warning("⚠️ Serveur Ollama non accessible ou aucun modèle installé")
+def get_appropriate_model(available_models, question):
+    """Sélectionne le modèle le plus approprié selon la question"""
+    complexity = analyze_question_complexity(question)
+    if complexity == "PETIT":
+        # Trouver le plus petit modèle
+        return min(
+            available_models.values(),
+            key=lambda m: MODEL_INFO[m.split(':')[0]]['size']
+        )
     else:
-        for model_name, full_name in available_models.items():
-            if model_name in MODEL_INFO:  # Vérifier si on a les infos pour ce modèle
-                info = MODEL_INFO[model_name]
-                with st.expander(f"{full_name} ({info['size']})"):
-                    st.write("Benchmarks:")
-                    for benchmark, score in info["benchmarks"].items():
-                        st.write(f"- {benchmark}: {score}")
-                    st.write("Spécialités:", ", ".join(info["specialties"]))
-            else:
-                # Pour les modèles installés mais non configurés dans MODEL_INFO
-                with st.expander(f"{full_name}"):
-                    st.write("*Informations non disponibles pour ce modèle*")
+        # Par défaut, prendre un modèle moyen
+        return list(available_models.values())[0]
 
-with col2:
-    question = st.text_area("Posez votre question:")
-    max_time = st.slider(
-        "Temps maximum (secondes)",
-        min_value=30,
-        max_value=180,
-        value=60,
-        key="max_time_slider"
+
+def load_chat_history():
+    """Load chat history from JSON file"""
+    history_file = "chat_history.json"
+    if os.path.exists(history_file):
+        with open(history_file, 'r', encoding='utf-8') as f:
+            st.session_state.chat_history = json.load(f)
+    else:
+        st.session_state.chat_history = []
+
+
+def initialize_session_state():
+    """Initialize session state variables"""
+    if 'OLLAMA_HOST' not in st.session_state:
+        st.session_state.OLLAMA_HOST = "http://localhost:11434"
+    if 'client' not in st.session_state:
+        st.session_state.client = None
+    if 'chats' not in st.session_state:
+        st.session_state.chats = {}  # {chat_id: {title, messages, model}}
+    if 'current_chat_id' not in st.session_state:
+        st.session_state.current_chat_id = None
+    if 'chat_counter' not in st.session_state:
+        st.session_state.chat_counter = 0
+
+
+# Déplacer l'initialisation après la définition des fonctions
+if 'chat_history' not in st.session_state:
+    load_chat_history()
+if 'current_iteration' not in st.session_state:
+    st.session_state.current_iteration = 0
+if 'best_response' not in st.session_state:
+    st.session_state.best_response = None
+if 'client' not in st.session_state:
+    st.session_state.client = ollama.Client(host="http://localhost:11434")
+if 'stop_generation' not in st.session_state:
+    st.session_state.stop_generation = False
+
+
+def save_chat_history(question, decision, responses):
+    """Save chat to history"""
+    chat_entry = {
+        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'question': question,
+        'strategy': decision['strategy'],
+        'models_used': [str(m) for m in decision['selected_models']],
+        'responses': responses,
+    }
+
+    st.session_state.chat_history.append(chat_entry)
+
+    # Save to file
+    with open("chat_history.json", 'w', encoding='utf-8') as f:
+        json.dump(st.session_state.chat_history, f, ensure_ascii=False, indent=2)
+
+
+def clear_model_memory(model_name):
+    """Clear model's memory in Ollama"""
+    try:
+        st.session_state.client.delete(model_name)
+        st.session_state.client.pull(model_name)
+    except Exception as e:
+        st.warning(f"Could not reset model {model_name}: {str(e)}")
+
+
+def show_chat_history():
+    """Display chat history with options"""
+    st.sidebar.markdown("### 📚 Chat History")
+
+    if not st.session_state.chat_history:
+        st.sidebar.info("No chat history yet")
+        return
+
+    # Search in history
+    search_term = st.sidebar.text_input("🔍 Search in history", "")
+
+    # Filter history
+    filtered_history = st.session_state.chat_history
+    if search_term:
+        filtered_history = [
+            chat for chat in st.session_state.chat_history
+            if search_term.lower() in chat['question'].lower()
+        ]
+
+    # Clear history button
+    if st.sidebar.button("🗑️ Clear History"):
+        st.session_state.chat_history = []
+        os.remove("chat_history.json")
+        st.sidebar.success("History cleared!")
+        return
+
+    # Display chats
+    for i, chat in enumerate(filtered_history):
+        with st.sidebar.expander(f"💭 {chat['question'][:50]}...", expanded=False):
+            st.write(f"**Time:** {chat['timestamp']}")
+            st.write(f"**Strategy:** {chat['strategy']}")
+
+            # Copy question button
+            if st.button("📋 Copy Question", key=f"copy_{i}"):
+                st.session_state.copied_question = chat['question']
+                st.success("Question copied!")
+
+            # Show responses
+            for model, response in chat['responses'].items():
+                st.markdown(f"**Response from {model}:**")
+                st.write(response)
+
+                # Copy response button
+                if st.button("📋 Copy Response", key=f"copy_response_{i}_{model}"):
+                    st.session_state.copied_response = response
+                    st.success("Response copied!")
+                st.markdown("---")
+
+
+def setup_ollama_connection():
+    """Setup Ollama server connection"""
+    st.sidebar.markdown("### ⚙️ Server Configuration")
+
+    server_type = st.sidebar.radio(
+        "Server Location:",
+        ["Local", "Remote"],
+        help="Choose where your Ollama server is running"
     )
 
-    if st.button("Obtenir la meilleure réponse"):
-        if question:
-            with st.spinner("🤔 Analyse de la question..."):
-                decision = get_manager_decision(question, max_time)
+    if server_type == "Local":
+        host = st.sidebar.text_input(
+            "Local Server URL",
+            value="http://localhost:11434",
+            help="Usually http://localhost:11434"
+        )
+    else:
+        host = st.sidebar.text_input(
+            "Remote Server URL",
+            value="http://",
+            help="Example: http://your-server:11434"
+        )
 
-            if decision:
-                st.markdown("### 🎯 Stratégie du manager:")
-                st.markdown(decision['strategy'])
+    if st.sidebar.button("Connect to Server"):
+        try:
+            st.session_state.OLLAMA_HOST = host
+            st.session_state.client = ollama.Client(host=host)
+            st.session_state.client.list()
+            st.sidebar.success("✅ Connected to Ollama server!")
+        except Exception as e:
+            st.sidebar.error(f"❌ Connection failed: {str(e)}")
+            st.session_state.client = None
 
-                st.markdown("### 📝 Question reformulée:")
-                st.markdown(decision['reformulated_question'])
 
-                # Créer un conteneur pour les réponses
-                responses_container = st.container()
+def show_conversation():
+    """Affiche la conversation en cours avec contexte"""
+    st.markdown("### 💬 Current Conversation")
 
-                with responses_container:
-                    # Créer les colonnes pour les réponses
-                    num_models = len(decision['selected_models'])
-                    if num_models > 0:
-                        cols = st.columns(min(num_models, 2))  # Maximum 2 colonnes
-                        responses = []
-
-                        for i, (model_name, col) in enumerate(zip(decision['selected_models'], cols)):
-                            with col:
-                                st.markdown(f"#### Réponse de {model_name}:")
-                                response = get_response(model_name, decision['reformulated_question'])
-                                responses.append(response)
-
-                        # Synthèse si nécessaire
-                        valid_responses = [r for r in responses if r['status'] == 'success']
-                        if len(valid_responses) > 1:
-                            st.markdown("### 💡 Synthèse finale:")
-                            synthesis = synthesize_responses(responses)
-                            st.markdown(synthesis)
-            else:
-                st.error("Veuillez installer au moins un des modèles configurés sur le serveur Ollama.")
+    for msg in st.session_state.conversation_history:
+        if msg['role'] == 'user':
+            st.markdown(f"**You:** {msg['content']}")
         else:
-            st.warning("Veuillez entrer une question.")
+            st.markdown(f"**Assistant ({msg.get('model', 'Unknown')}):** {msg['content']}")
+
+    # Afficher le modèle actuel
+    if st.session_state.current_model:
+        st.markdown(f"*Currently chatting with: {st.session_state.current_model}*")
+
+
+def create_new_chat():
+    """Crée un nouveau chat"""
+    chat_id = str(st.session_state.chat_counter)
+    st.session_state.chats[chat_id] = {
+        'title': f"New Chat {chat_id}",
+        'messages': [],
+        'model': None,
+        'created_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    st.session_state.current_chat_id = chat_id
+    st.session_state.chat_counter += 1
+    save_chats()  # Sauvegarder immédiatement
+    return chat_id
+
+
+def save_chats():
+    """Sauvegarde tous les chats dans un fichier"""
+    with open("chats.json", 'w', encoding='utf-8') as f:
+        json.dump(st.session_state.chats, f, ensure_ascii=False, indent=2)
+
+
+def load_chats():
+    """Charge les chats depuis le fichier"""
+    if os.path.exists("chats.json"):
+        with open("chats.json", 'r', encoding='utf-8') as f:
+            st.session_state.chats = json.load(f)
+            # Mettre à jour le compteur
+            if st.session_state.chats:
+                st.session_state.chat_counter = max(
+                    int(chat_id) for chat_id in st.session_state.chats.keys()
+                ) + 1
+
+
+def show_chat_sidebar():
+    """Affiche la sidebar avec la liste des chats"""
+    st.sidebar.markdown("### 💭 Your Chats")
+
+    # Bouton nouveau chat
+    if st.sidebar.button("➕ New Chat"):
+        create_new_chat()
+        st.rerun()
+
+    st.sidebar.markdown("---")
+
+    # Liste des chats
+    for chat_id, chat in sorted(st.session_state.chats.items(), key=lambda x: x[1]['created_at'], reverse=True):
+        col1, col2 = st.sidebar.columns([4, 1])
+
+        # Titre du chat avec modèle
+        title = chat['title']
+        if chat['messages']:
+            first_msg = chat['messages'][0]['content']
+            title = first_msg[:30] + "..." if len(first_msg) > 30 else first_msg
+            if chat.get('model'):
+                title = f"{title} ({chat['model']})"
+
+        # Sélection du chat
+        if col1.button(f"📝 {title}", key=f"chat_{chat_id}"):
+            st.session_state.current_chat_id = chat_id
+            st.rerun()
+
+        # Bouton suppression
+        if col2.button("🗑️", key=f"del_{chat_id}"):
+            if chat_id == st.session_state.current_chat_id:
+                # Si on supprime le chat actuel, sélectionner le plus récent
+                remaining_chats = [cid for cid in st.session_state.chats.keys() if cid != chat_id]
+                st.session_state.current_chat_id = remaining_chats[0] if remaining_chats else None
+            del st.session_state.chats[chat_id]
+            save_chats()
+            st.rerun()
+
+
+def show_current_chat():
+    """Affiche le chat actuel"""
+    if not st.session_state.current_chat_id or st.session_state.current_chat_id not in st.session_state.chats:
+        if st.session_state.chats:
+            latest_chat_id = max(st.session_state.chats.keys())
+            st.session_state.current_chat_id = latest_chat_id
+        else:
+            create_new_chat()
+            st.rerun()
+            return
+
+    chat = st.session_state.chats[st.session_state.current_chat_id]
+
+    # Afficher le modèle actuel si défini
+    if chat.get('model'):
+        st.markdown(f"*🤖 Current model: {chat['model']}*")
+
+    # Afficher les messages
+    for msg in chat['messages']:
+        if msg['role'] == 'user':
+            st.markdown(f"**You:** {msg['content']}")
+        else:
+            model_name = msg.get('model', 'Unknown')
+            st.markdown(f"**Assistant ({model_name}):** {msg['content']}")
+
+
+def main():
+    """Point d'entrée principal"""
+    st.markdown("<h1 class='main-header'>🤖 LLM Manager Pro</h1>", unsafe_allow_html=True)
+
+    initialize_session_state()
+    setup_ollama_connection()
+    load_chats()
+
+    show_chat_sidebar()
+
+    if not st.session_state.client:
+        st.warning("⚠️ Please configure and connect to an Ollama server first")
+        return
+
+    show_current_chat()
+
+    if st.session_state.current_chat_id:
+        question = st.text_area("Enter your message:", height=100)
+
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            max_time = st.slider(
+                "Response Intelligence Level",
+                min_value=30,
+                max_value=180,
+                value=60,
+                help="Higher IQ = more thoughtful responses"
+            )
+        with col2:
+            st.markdown(f"""
+            🧠 Intelligence:
+            - IQ 100 (30)
+            - IQ 120 (60)
+            - IQ 140 (120)
+            - IQ 160 (180)
+            """)
+
+        if st.button("Send"):
+            if question:
+                # Toujours demander une nouvelle décision
+                with st.spinner("🤔 Analyzing..."):
+                    decision = get_manager_decision(question, max_time)
+
+                    if decision:
+                        st.markdown("### 🎯 Strategy:")
+                        st.markdown(decision['strategy'])
+
+                        for model_name in decision['selected_models']:
+                            response = get_response(
+                                model_name,
+                                question,
+                                st.session_state.current_chat_id
+                            )
+
+
+if __name__ == "__main__":
+    main()
