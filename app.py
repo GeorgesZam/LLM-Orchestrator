@@ -13,6 +13,12 @@ import psutil
 import platform
 import subprocess
 from datetime import datetime
+from PIL import Image
+import io
+from langchain.agents import initialize_agent, AgentType
+from langchain.tools import DuckDuckGoSearchRun
+from langchain.chat_models import ChatOllama
+from bs4 import BeautifulSoup
 
 # Streamlit page configuration
 st.set_page_config(page_title="LLM Orchestrator", layout="wide")
@@ -119,6 +125,8 @@ def initialize_session_state():
         st.session_state.current_chat_id = None
     if 'chat_counter' not in st.session_state:
         st.session_state.chat_counter = 0
+    if 'uploaded_files' not in st.session_state:
+        st.session_state.uploaded_files = []
 
 
 def get_available_models():
@@ -139,11 +147,16 @@ def get_available_models():
         return {}
 
 
-def get_manager_prompt(question, max_time, available_models):
+def get_manager_prompt(question, max_time, available_models, files=None):
     """Create prompt for LLM manager"""
+    file_info = ""
+    if files:
+        file_info = "\nAttached files:\n" + "\n".join([f"- {f.name} ({f.type})" for f in files])
+
     return f"""You are an expert in LLM model selection. Quickly choose the most appropriate model.
 
 Question: "{question}"
+{file_info}
 
 Available models:
 {json.dumps(list(available_models.values()), indent=2)}
@@ -153,6 +166,8 @@ Simple rules:
 - Knowledge questions: medium model
 - Creative questions, suggestions: large model
 - Complex analysis: large model
+- Images: vision model if available
+- Documents: tool model if available
 
 JSON format only:
 {{
@@ -166,45 +181,50 @@ def get_manager_decision(question, max_time):
     available_models = get_available_models()
 
     if not available_models:
-        st.error("No models available")
+        st.error("Aucun modèle disponible")
         return None
 
-    manager_model = list(available_models.values())[0]
+    # Vérifier si la question nécessite une recherche web
+    needs_search = any(keyword in question.lower() for keyword in [
+        "actualité", "dernière", "récent", "nouveau", "news",
+        "quoi de neuf", "qu'est-ce qui se passe"
+    ])
 
-    try:
-        response = st.session_state.client.chat(
-            model=manager_model,
-            messages=[{
-                'role': 'user',
-                'content': get_manager_prompt(question, max_time, available_models)
-            }],
-            stream=False,
-            options={'temperature': 0}
-        )
-
-        content = response['message']['content'].strip()
-        if content.startswith("```"):
-            content = re.sub(r'^```.*\n|```$', '', content)
-
-        decision = json.loads(content)
-        selected_model = decision['selected_models'][0]
-
-        if selected_model in available_models.values():
-            return decision
-        else:
-            fallback_model = list(available_models.values())[0]
+    if needs_search:
+        # Pour les recherches web, préférer un petit modèle rapide
+        small_models = [m for m in available_models.values()
+                        if any(name in m.lower() for name in ['mistral', 'phi'])]
+        if small_models:
             return {
-                'selected_models': [fallback_model],
-                'strategy': f"Default model"
+                'selected_models': [small_models[0]],
+                'strategy': "Recherche web avec modèle rapide"
             }
 
-    except Exception as e:
-        st.error(f"Error: {str(e)}")
-        fallback_model = list(available_models.values())[0]
-        return {
-            'selected_models': [fallback_model],
-            'strategy': "Default model (error)"
-        }
+    # Analyse de la complexité pour les autres cas
+    complexity = analyze_question_complexity(question)
+
+    if complexity == "SMALL":
+        small_models = [m for m in available_models.values()
+                        if any(name in m.lower() for name in ['mistral', 'phi'])]
+        if small_models:
+            return {
+                'selected_models': [small_models[0]],
+                'strategy': "Modèle léger pour une question simple"
+            }
+    else:
+        large_models = [m for m in available_models.values()
+                        if any(name in m.lower() for name in ['llama', 'mixtral', 'solar'])]
+        if large_models:
+            return {
+                'selected_models': [large_models[0]],
+                'strategy': "Modèle puissant pour une analyse approfondie"
+            }
+
+    # Fallback sur n'importe quel modèle disponible
+    return {
+        'selected_models': [list(available_models.values())[0]],
+        'strategy': "Modèle par défaut"
+    }
 
 
 def analyze_question_complexity(question):
@@ -231,56 +251,106 @@ def get_appropriate_model(available_models, question):
         return list(available_models.values())[0]
 
 
-def get_response(model, question, chat_id):
+def get_response(model, question, chat_id, force_web_search=False):
     """Get response with chat context"""
     try:
         response_container = st.empty()
-        response_container.markdown(f"*🤖 Response from {model}...*")
+        response_container.markdown(f"*🤖 Réponse de {model}...*")
 
-        full_response = ""
+        needs_search = force_web_search or any(keyword in question.lower() for keyword in [
+            "actualité", "dernière", "récent", "nouveau", "news",
+            "quoi de neuf", "qu'est-ce qui se passe"
+        ])
 
-        messages = [
-            {'role': 'system', 'content': 'You are a helpful assistant. Maintain context of the conversation.'}
-        ]
+        if needs_search:
+            response_container.markdown("*🔎 Recherche web...*")
+            search_results = search_brave(question)
 
-        chat = st.session_state.chats[chat_id]
-        for msg in chat['messages']:
-            messages.append(msg)
+            # Formatage des résultats pour le LLM
+            formatted_results = "\n\n".join([
+                f"Source: {r['title']}\n{r['description']}"
+                for r in search_results
+            ])
 
-        messages.append({'role': 'user', 'content': question})
+            # Utilisation du modèle local pour résumer les résultats
+            messages = [
+                {'role': 'system',
+                 'content': 'Vous êtes un assistant qui résume des informations web en français de manière concise.'},
+                {'role': 'user',
+                 'content': f"Résumez ces résultats de recherche sur '{question}':\n\n{formatted_results}"}
+            ]
 
-        stream_response = st.session_state.client.chat(
-            model=model,
-            messages=messages,
-            stream=True
-        )
+            stream_response = st.session_state.client.chat(
+                model=model,
+                messages=messages,
+                stream=True
+            )
 
-        for chunk in stream_response:
-            if 'message' in chunk and 'content' in chunk['message']:
-                content = chunk['message']['content']
-                full_response += content
-                response_container.markdown(f"*🤖 {model}:*\n{full_response}▌")
+            full_response = ""
+            for chunk in stream_response:
+                if 'message' in chunk and 'content' in chunk['message']:
+                    content = chunk['message']['content']
+                    full_response += content
+                    response_container.markdown(f"*🤖 {model}:*\n{full_response}▌")
+        else:
+            # Préparation du message système
+            messages = [
+                {'role': 'system',
+                 'content': 'Vous êtes un assistant intelligent capable d\'analyser des images et du texte. Répondez en français.'}
+            ]
 
-        response_container.markdown(f"*🤖 {model}:*\n{full_response}")
+            # Préparation du message utilisateur avec l'image
+            user_message = {
+                'role': 'user',
+                'content': question
+            }
 
-        chat['messages'].append({
-            'role': 'user',
-            'content': question,
-            'model': model
-        })
-        chat['messages'].append({
+            # Si le dernier message contient des images
+            if st.session_state.chats[chat_id]['messages'] and 'files' in st.session_state.chats[chat_id]['messages'][
+                -1]:
+                images = []
+                for file in st.session_state.chats[chat_id]['messages'][-1]['files']:
+                    if file['type'].startswith('image/'):
+                        # Convertir l'image en bytes
+                        image = Image.open(io.BytesIO(file['content']))
+                        img_byte_arr = io.BytesIO()
+                        image.save(img_byte_arr, format='PNG')
+                        images.append(img_byte_arr.getvalue())
+
+                if images:
+                    user_message['images'] = images
+
+            messages.append(user_message)
+
+            # Appel au modèle avec gestion du streaming
+            stream_response = st.session_state.client.chat(
+                model=model,
+                messages=messages,
+                stream=True
+            )
+
+            full_response = ""
+            for chunk in stream_response:
+                if 'message' in chunk and 'content' in chunk['message']:
+                    content = chunk['message']['content']
+                    full_response += content
+                    response_container.markdown(f"*🤖 {model}:*\n{full_response}▌")
+
+            response_container.markdown(f"*🤖 {model}:*\n{full_response}")
+
+        # Sauvegarder la réponse dans l'historique
+        st.session_state.chats[chat_id]['messages'].append({
             'role': 'assistant',
             'content': full_response,
-            'model': model
+            'model': model,
+            'web_search': needs_search
         })
-        chat['model'] = model
 
         save_chats()
-
         return {'status': 'success', 'content': full_response}
 
     except Exception as e:
-        st.error(f"Error: {str(e)}")
+        st.error(f"Erreur : {str(e)}")
         return {'status': 'error', 'content': str(e)}
 
 
@@ -299,15 +369,49 @@ def create_new_chat():
 
 
 def save_chats():
-    """Save chats to session state"""
-    # In a real app, save to database
-    pass
+    """Save chats to JSON file"""
+    try:
+        chats_data = {
+            chat_id: {
+                'title': chat['title'],
+                'messages': chat['messages'],
+                'model': chat.get('model'),
+                'created_at': chat['created_at']
+            }
+            for chat_id, chat in st.session_state.chats.items()
+        }
+
+        with open('chats.json', 'w', encoding='utf-8') as f:
+            json.dump(chats_data, f, ensure_ascii=False, indent=2)
+
+    except Exception as e:
+        st.error(f"Erreur lors de la sauvegarde des chats : {str(e)}")
 
 
 def load_chats():
-    """Load chats from session state"""
-    # In a real app, load from database
-    pass
+    """Load chats from JSON file"""
+    try:
+        if not os.path.exists('chats.json'):
+            # Créer le fichier s'il n'existe pas
+            with open('chats.json', 'w', encoding='utf-8') as f:
+                json.dump({}, f)
+            return
+
+        with open('chats.json', 'r', encoding='utf-8') as f:
+            chats_data = json.load(f)
+
+        st.session_state.chats = chats_data
+
+        # Mettre à jour le compteur de chat
+        if chats_data:
+            max_chat_id = max(int(chat_id) for chat_id in chats_data.keys())
+            st.session_state.chat_counter = max_chat_id + 1
+
+    except Exception as e:
+        st.error(f"Erreur lors du chargement des chats : {str(e)}")
+        # Créer un fichier vide en cas d'erreur
+        with open('chats.json', 'w', encoding='utf-8') as f:
+            json.dump({}, f)
 
 
 def setup_ollama_connection():
@@ -385,9 +489,103 @@ def show_current_chat():
     for msg in chat['messages']:
         if msg['role'] == 'user':
             st.markdown(f"**You:** {msg['content']}")
+            if 'files' in msg:
+                for file in msg['files']:
+                    if file['type'].startswith('image/'):
+                        st.image(file['content'], caption=file['name'])
+                    elif isinstance(file['content'], pd.DataFrame):
+                        st.dataframe(file['content'])
+                    else:
+                        st.text(f"File: {file['name']}")
         else:
             model_name = msg.get('model', 'Unknown')
             st.markdown(f"**Assistant ({model_name}):** {msg['content']}")
+
+
+def process_uploaded_files(files):
+    """Process uploaded files and return their content"""
+    file_contents = []
+    for file in files:
+        content = None
+        try:
+            if file.type.startswith('image/'):
+                # Lire directement les bytes du fichier
+                content = file.getvalue()
+            elif file.type == 'text/csv':
+                content = pd.read_csv(file)
+            elif file.type == 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':
+                content = pd.read_excel(file)
+            elif file.type == 'text/plain':
+                content = file.getvalue().decode()
+
+            if content is not None:
+                file_contents.append({
+                    'name': file.name,
+                    'type': file.type,
+                    'content': content
+                })
+        except Exception as e:
+            st.error(f"Erreur lors du traitement du fichier {file.name}: {str(e)}")
+
+    return file_contents
+
+
+def initialize_search_agent():
+    """Initialise l'agent de recherche web avec DuckDuckGo"""
+    try:
+        search_tool = DuckDuckGoSearchRun()
+        llm = ChatOllama(
+            model="mistral",
+            base_url=st.session_state.OLLAMA_HOST
+        )
+
+        agent = initialize_agent(
+            tools=[search_tool],
+            llm=llm,
+            agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+            verbose=True
+        )
+
+        return agent
+    except Exception as e:
+        st.error(f"Erreur lors de l'initialisation de l'agent de recherche : {str(e)}")
+        return None
+
+
+def search_brave(query):
+    """Effectue une recherche web via Brave Search"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+
+    url = f"https://search.brave.com/search?q={query.replace(' ', '+')}"
+
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        results = []
+
+        for result in soup.select(".snippet"):
+            title_elem = result.select_one(".title")
+            url_elem = result.select_one(".url")
+            description_elem = result.select_one(".description")
+
+            if title_elem and url_elem:
+                title = title_elem.text.strip()
+                url = url_elem.text.strip()
+                description = description_elem.text.strip() if description_elem else ""
+                results.append({
+                    "title": title,
+                    "url": url,
+                    "description": description
+                })
+
+        return results[:3]  # Retourne les 3 premiers résultats
+
+    except Exception as e:
+        return [{"title": "Erreur de recherche", "description": str(e)}]
 
 
 def main():
@@ -407,9 +605,21 @@ def main():
     show_current_chat()
 
     if st.session_state.current_chat_id:
+        # Mettre l'upload de fichiers AVANT la zone de texte
+        uploaded_files = st.file_uploader(
+            "Upload files (Images, CSV, Excel, Text)",
+            accept_multiple_files=True,
+            type=['png', 'jpg', 'jpeg', 'csv', 'xlsx', 'txt']
+        )
+
+        # Mettre à jour la session state immédiatement
+        if uploaded_files:
+            st.session_state.uploaded_files = uploaded_files
+
         question = st.text_area("Enter your message:", height=100)
 
-        col1, col2 = st.columns([3, 1])
+        # Nouvelle disposition avec 3 colonnes
+        col1, col2, col3 = st.columns([2, 1, 1])
         with col1:
             max_time = st.slider(
                 "Response Intelligence Level",
@@ -419,28 +629,40 @@ def main():
                 help="Higher value = more thoughtful responses"
             )
         with col2:
-            st.markdown(f"""
-            Intelligence:
-            - Level 1 (30)
-            - Level 2 (60)
-            - Level 3 (120)
-            - Level 4 (180)
-            """)
+            use_web_search = st.checkbox("🔎 Recherche web",
+                                         help="Utiliser DuckDuckGo pour obtenir des informations récentes")
+        with col3:
+            send_button = st.button("Send")
 
-        if st.button("Send"):
-            if question:
+        if send_button:
+            if question or uploaded_files:
                 with st.spinner("Analyzing..."):
+                    processed_files = process_uploaded_files(uploaded_files) if uploaded_files else None
+
                     decision = get_manager_decision(question, max_time)
 
                     if decision:
+                        if use_web_search:  # Forcer la recherche web si la case est cochée
+                            decision['strategy'] = "Recherche web avec modèle rapide"
+                            decision['selected_models'] = ["mistral"]  # Utiliser mistral pour la recherche web
+
                         st.markdown("### Strategy:")
                         st.markdown(decision['strategy'])
 
                         for model_name in decision['selected_models']:
+                            if processed_files:
+                                st.session_state.chats[st.session_state.current_chat_id]['messages'].append({
+                                    'role': 'user',
+                                    'content': question,
+                                    'files': processed_files,
+                                    'model': model_name
+                                })
+
                             response = get_response(
                                 model_name,
                                 question,
-                                st.session_state.current_chat_id
+                                st.session_state.current_chat_id,
+                                force_web_search=use_web_search  # Nouveau paramètre
                             )
 
 
