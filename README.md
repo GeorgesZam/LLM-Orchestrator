@@ -27,13 +27,13 @@
 
 ### Prerequisites
 - **Python 3.8+** installed on your system.
-- **Ollama** set up and running. Check out the [Ollama Installation Guide](https://ollama.ai/docs/installation).
+- **Ollama** set up and running. Check out the [Ollama Installation Guide](https://ollama.ai/docs/installation)
 - Download your preferred LLM models via Ollama (e.g., `ollama pull llama2`).
 
 ### Installation Steps
 1. Clone the repository:
    ```bash
-   git clone https://github.com/your-username/llm-orchestrator.git
+   git clone [https://github.com/GeorgesZam/llm-orchestrator.git](https://github.com/GeorgesZam/LLM-Orchestrator.git)
    cd llm-orchestrator
    ```
 
