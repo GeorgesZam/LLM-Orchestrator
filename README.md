@@ -33,7 +33,7 @@
 ### Installation Steps
 1. Clone the repository:
    ```bash
-   git clone [https://github.com/GeorgesZam/llm-orchestrator.git](https://github.com/GeorgesZam/LLM-Orchestrator.git)
+   git clone [https://github.com/GeorgesZam/llm-orchestrator.git]
    cd llm-orchestrator
    ```
 
