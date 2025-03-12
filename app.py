@@ -133,18 +133,18 @@ def get_available_models():
     """Get list of available models on the machine"""
     try:
         response = st.session_state.client.list()
-        models = {}
+        models = []
 
         for model in response.models:
             if hasattr(model, 'model'):
                 name = str(model.model)
-                base_name = name.split(':')[0]
-                models[base_name] = name
+                # Ajouter tous les modèles, y compris ceux avec des tags spécifiques
+                models.append(name)
 
         return models
     except Exception as e:
         st.error(f"Error retrieving models: {str(e)}")
-        return {}
+        return []
 
 
 def get_manager_prompt(question, max_time, available_models, files=None):
@@ -152,7 +152,7 @@ def get_manager_prompt(question, max_time, available_models, files=None):
     file_info = ""
     if files:
         file_info = "\nAttached files:\n" + "\n".join([f"- {f.name} ({f.type})" for f in files])
-
+    
     return f"""You are an expert in LLM model selection. Quickly choose the most appropriate model.
 
 Question: "{question}"
@@ -176,54 +176,53 @@ JSON format only:
 }}"""
 
 
-def get_manager_decision(question, max_time):
-    """Get quick decision from manager"""
+def get_manager_decision(question, reasoning_level):
+    """Get quick decision from manager based on reasoning level and question"""
     available_models = get_available_models()
 
     if not available_models:
-        st.error("Aucun modèle disponible")
+        st.error("No models available")
         return None
 
-    # Vérifier si la question nécessite une recherche web
-    needs_search = any(keyword in question.lower() for keyword in [
-        "actualité", "dernière", "récent", "nouveau", "news",
-        "quoi de neuf", "qu'est-ce qui se passe"
-    ])
+    # Check if images are present in the last message
+    current_chat = st.session_state.chats.get(st.session_state.current_chat_id, {})
+    messages = current_chat.get('messages', [])
+    has_images = False
+    
+    if messages and 'files' in messages[-1]:
+        has_images = any(file['type'].startswith('image/') for file in messages[-1]['files'])
 
-    if needs_search:
-        # Pour les recherches web, préférer un petit modèle rapide
-        small_models = [m for m in available_models.values()
-                        if any(name in m.lower() for name in ['mistral', 'phi'])]
-        if small_models:
+    # If image is present, look for vision models
+    if has_images:
+        vision_models = [m for m in available_models 
+                        if any(name in m.lower() for name in ['llava', 'bakllava', 'vision'])]
+        if vision_models:
             return {
-                'selected_models': [small_models[0]],
-                'strategy': "Recherche web avec modèle rapide"
+                'selected_models': [vision_models[0]],
+                'strategy': "Using vision model for image analysis"
             }
 
-    # Analyse de la complexité pour les autres cas
-    complexity = analyze_question_complexity(question)
+    # Model selection based on reasoning level
+    if reasoning_level == "Quick":
+        preferred_models = ['mistral', 'phi']
+    elif reasoning_level == "Thoughtful":
+        preferred_models = ['llama2', 'mixtral']
+    else:  # Deep
+        preferred_models = ['mixtral', 'solar', 'llama2:70b']
 
-    if complexity == "SMALL":
-        small_models = [m for m in available_models.values()
-                        if any(name in m.lower() for name in ['mistral', 'phi'])]
-        if small_models:
+    # Find the first available preferred model
+    for model_type in preferred_models:
+        matching_models = [m for m in available_models if model_type.lower() in m.lower()]
+        if matching_models:
             return {
-                'selected_models': [small_models[0]],
-                'strategy': "Modèle léger pour une question simple"
-            }
-    else:
-        large_models = [m for m in available_models.values()
-                        if any(name in m.lower() for name in ['llama', 'mixtral', 'solar'])]
-        if large_models:
-            return {
-                'selected_models': [large_models[0]],
-                'strategy': "Modèle puissant pour une analyse approfondie"
+                'selected_models': [matching_models[0]],
+                'strategy': f"Using {matching_models[0]} for {reasoning_level.lower()} reasoning"
             }
 
-    # Fallback sur n'importe quel modèle disponible
+    # Fallback to any available model
     return {
-        'selected_models': [list(available_models.values())[0]],
-        'strategy': "Modèle par défaut"
+        'selected_models': [available_models[0]],
+        'strategy': "Using default model"
     }
 
 
@@ -256,36 +255,34 @@ def get_response(model, question, chat_id, force_web_search=False):
     try:
         response_container = st.empty()
         response_container.markdown(f"*🤖 Réponse de {model}...*")
-
+        
         needs_search = force_web_search or any(keyword in question.lower() for keyword in [
             "actualité", "dernière", "récent", "nouveau", "news",
             "quoi de neuf", "qu'est-ce qui se passe"
         ])
-
+        
         if needs_search:
             response_container.markdown("*🔎 Recherche web...*")
             search_results = search_brave(question)
-
+            
             # Formatage des résultats pour le LLM
             formatted_results = "\n\n".join([
-                f"Source: {r['title']}\n{r['description']}"
+                f"Source: {r['title']}\n{r['description']}" 
                 for r in search_results
             ])
-
+            
             # Utilisation du modèle local pour résumer les résultats
             messages = [
-                {'role': 'system',
-                 'content': 'Vous êtes un assistant qui résume des informations web en français de manière concise.'},
-                {'role': 'user',
-                 'content': f"Résumez ces résultats de recherche sur '{question}':\n\n{formatted_results}"}
+                {'role': 'system', 'content': 'Vous êtes un assistant qui résume des informations web en français de manière concise.'},
+                {'role': 'user', 'content': f"Résumez ces résultats de recherche sur '{question}':\n\n{formatted_results}"}
             ]
-
+            
             stream_response = st.session_state.client.chat(
                 model=model,
                 messages=messages,
                 stream=True
             )
-
+            
             full_response = ""
             for chunk in stream_response:
                 if 'message' in chunk and 'content' in chunk['message']:
@@ -295,8 +292,7 @@ def get_response(model, question, chat_id, force_web_search=False):
         else:
             # Préparation du message système
             messages = [
-                {'role': 'system',
-                 'content': 'Vous êtes un assistant intelligent capable d\'analyser des images et du texte. Répondez en français.'}
+                {'role': 'system', 'content': 'Vous êtes un assistant intelligent capable d\'analyser des images et du texte. Répondez en français.'}
             ]
 
             # Préparation du message utilisateur avec l'image
@@ -306,8 +302,7 @@ def get_response(model, question, chat_id, force_web_search=False):
             }
 
             # Si le dernier message contient des images
-            if st.session_state.chats[chat_id]['messages'] and 'files' in st.session_state.chats[chat_id]['messages'][
-                -1]:
+            if st.session_state.chats[chat_id]['messages'] and 'files' in st.session_state.chats[chat_id]['messages'][-1]:
                 images = []
                 for file in st.session_state.chats[chat_id]['messages'][-1]['files']:
                     if file['type'].startswith('image/'):
@@ -316,7 +311,7 @@ def get_response(model, question, chat_id, force_web_search=False):
                         img_byte_arr = io.BytesIO()
                         image.save(img_byte_arr, format='PNG')
                         images.append(img_byte_arr.getvalue())
-
+            
                 if images:
                     user_message['images'] = images
 
@@ -380,10 +375,10 @@ def save_chats():
             }
             for chat_id, chat in st.session_state.chats.items()
         }
-
+        
         with open('chats.json', 'w', encoding='utf-8') as f:
             json.dump(chats_data, f, ensure_ascii=False, indent=2)
-
+            
     except Exception as e:
         st.error(f"Erreur lors de la sauvegarde des chats : {str(e)}")
 
@@ -396,17 +391,17 @@ def load_chats():
             with open('chats.json', 'w', encoding='utf-8') as f:
                 json.dump({}, f)
             return
-
+            
         with open('chats.json', 'r', encoding='utf-8') as f:
             chats_data = json.load(f)
-
+            
         st.session_state.chats = chats_data
-
+        
         # Mettre à jour le compteur de chat
         if chats_data:
             max_chat_id = max(int(chat_id) for chat_id in chats_data.keys())
             st.session_state.chat_counter = max_chat_id + 1
-
+            
     except Exception as e:
         st.error(f"Erreur lors du chargement des chats : {str(e)}")
         # Créer un fichier vide en cas d'erreur
@@ -416,7 +411,7 @@ def load_chats():
 
 def setup_ollama_connection():
     """Setup Ollama server connection"""
-    st.sidebar.markdown("### Server Configuration")
+    st.sidebar.markdown("### 🖥️ Server Configuration")
 
     server_type = st.sidebar.radio(
         "Server Location:",
@@ -445,6 +440,52 @@ def setup_ollama_connection():
         except Exception as e:
             st.sidebar.error(f"Connection failed: {str(e)}")
             st.session_state.client = None
+
+    # Gestion des modèles si connecté
+    if st.session_state.client:
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("### 🤖 Gestion des Modèles")
+        
+        # Liste des modèles disponibles
+        available_models = get_available_models()
+        if available_models:
+            st.sidebar.markdown("**Modèles installés:**")
+            for model in sorted(available_models):
+                st.sidebar.markdown(f"- {model}")
+        
+        # Interface simplifiée pour ajouter un nouveau modèle
+        st.sidebar.markdown("**Installer un nouveau modèle**")
+        
+        # Liste prédéfinie de modèles populaires
+        popular_models = [
+            "mistral",
+            "llava",
+            "llava:13b",
+            "llama2",
+            "llama2:13b",
+            "mixtral",
+            "codellama",
+            "phi",
+            "solar"
+        ]
+        
+        # Menu déroulant pour les modèles populaires
+        new_model = st.sidebar.selectbox(
+            "Choisir un modèle à installer",
+            [""] + popular_models,
+            format_func=lambda x: "Sélectionner un modèle" if x == "" else x
+        )
+        
+        # Bouton d'installation
+        if new_model and st.sidebar.button("Installer le modèle", key="install_model"):
+            with st.sidebar.spinner(f"Installation de {new_model}..."):
+                try:
+                    st.session_state.client.pull(new_model)
+                    st.sidebar.success(f"✅ {new_model} installé avec succès!")
+                    time.sleep(2)  # Petit délai pour voir le message
+                    st.rerun()
+                except Exception as e:
+                    st.sidebar.error(f"Erreur lors de l'installation: {str(e)}")
 
 
 def show_chat_sidebar():
@@ -517,7 +558,7 @@ def process_uploaded_files(files):
                 content = pd.read_excel(file)
             elif file.type == 'text/plain':
                 content = file.getvalue().decode()
-
+            
             if content is not None:
                 file_contents.append({
                     'name': file.name,
@@ -526,7 +567,7 @@ def process_uploaded_files(files):
                 })
         except Exception as e:
             st.error(f"Erreur lors du traitement du fichier {file.name}: {str(e)}")
-
+    
     return file_contents
 
 
@@ -538,14 +579,14 @@ def initialize_search_agent():
             model="mistral",
             base_url=st.session_state.OLLAMA_HOST
         )
-
+        
         agent = initialize_agent(
             tools=[search_tool],
             llm=llm,
             agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
             verbose=True
         )
-
+        
         return agent
     except Exception as e:
         st.error(f"Erreur lors de l'initialisation de l'agent de recherche : {str(e)}")
@@ -559,11 +600,11 @@ def search_brave(query):
     }
 
     url = f"https://search.brave.com/search?q={query.replace(' ', '+')}"
-
+    
     try:
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
-
+        
         soup = BeautifulSoup(response.text, "html.parser")
         results = []
 
@@ -583,7 +624,7 @@ def search_brave(query):
                 })
 
         return results[:3]  # Retourne les 3 premiers résultats
-
+        
     except Exception as e:
         return [{"title": "Erreur de recherche", "description": str(e)}]
 
@@ -605,47 +646,68 @@ def main():
     show_current_chat()
 
     if st.session_state.current_chat_id:
-        # Mettre l'upload de fichiers AVANT la zone de texte
+        # File upload for images only
         uploaded_files = st.file_uploader(
-            "Upload files (Images, CSV, Excel, Text)",
+            "Upload images",
             accept_multiple_files=True,
-            type=['png', 'jpg', 'jpeg', 'csv', 'xlsx', 'txt']
+            type=['png', 'jpg', 'jpeg']
         )
 
-        # Mettre à jour la session state immédiatement
+        # Update session state immediately
         if uploaded_files:
             st.session_state.uploaded_files = uploaded_files
+            
+        # Check for images
+        has_images = uploaded_files and any(file.type.startswith('image/') for file in uploaded_files)
+        
+        # Show vision model selector if images are present
+        selected_model = None
+        if has_images:
+            available_models = get_available_models()
+            llava_models = [m for m in available_models if 'llava' in m.lower()]
+            
+            if llava_models:
+                st.markdown("### 🖼️ Image Detected - Vision Model Selection")
+                selected_model = st.selectbox(
+                    "Choose vision model:",
+                    sorted(llava_models),
+                    format_func=lambda x: f"🤖 {x}"
+                )
+                
+                if selected_model:
+                    st.info(f"Selected model: {selected_model}")
+            else:
+                st.warning("⚠️ No vision models available. Please install one with 'ollama pull llava'")
 
         question = st.text_area("Enter your message:", height=100)
 
-        # Nouvelle disposition avec 3 colonnes
-        col1, col2, col3 = st.columns([2, 1, 1])
+        # New layout with 2 columns
+        col1, col2 = st.columns([3, 1])
         with col1:
-            max_time = st.slider(
-                "Response Intelligence Level",
-                min_value=30,
-                max_value=180,
-                value=60,
-                help="Higher value = more thoughtful responses"
+            reasoning_level = st.radio(
+                "Reasoning level:",
+                ["Quick", "Thoughtful", "Deep"],
+                horizontal=True,
+                help="Choose the model's reasoning level"
             )
+            
         with col2:
-            use_web_search = st.checkbox("🔎 Recherche web",
-                                         help="Utiliser DuckDuckGo pour obtenir des informations récentes")
-        with col3:
             send_button = st.button("Send")
 
         if send_button:
             if question or uploaded_files:
-                with st.spinner("Analyzing..."):
+                with st.spinner("Processing..."):
                     processed_files = process_uploaded_files(uploaded_files) if uploaded_files else None
-
-                    decision = get_manager_decision(question, max_time)
+                    
+                    if has_images and selected_model:
+                        decision = {
+                            'selected_models': [selected_model],
+                            'strategy': "Using selected vision model for image analysis"
+                        }
+                    else:
+                        decision = get_manager_decision(question, reasoning_level)
 
                     if decision:
-                        if use_web_search:  # Forcer la recherche web si la case est cochée
-                            decision['strategy'] = "Recherche web avec modèle rapide"
-                            decision['selected_models'] = ["mistral"]  # Utiliser mistral pour la recherche web
-
                         st.markdown("### Strategy:")
                         st.markdown(decision['strategy'])
 
@@ -657,12 +719,11 @@ def main():
                                     'files': processed_files,
                                     'model': model_name
                                 })
-
+                            
                             response = get_response(
                                 model_name,
                                 question,
-                                st.session_state.current_chat_id,
-                                force_web_search=use_web_search  # Nouveau paramètre
+                                st.session_state.current_chat_id
                             )
 
 
